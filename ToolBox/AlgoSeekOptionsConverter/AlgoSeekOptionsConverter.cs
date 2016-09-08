@@ -22,6 +22,7 @@ using System.Diagnostics;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
 using QuantConnect.Lean.Engine.DataFeeds.Enumerators;
@@ -97,8 +98,21 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
             if (!files.Any()) throw new Exception("No csv files found");
 
             // Create multithreaded readers; start them in threads and store the ticks in queues
-            var readers = files.Select(file => new AlgoSeekOptionsReader(file, _referenceDate));
-            var synchronizer = new SynchronizingEnumerator(readers);
+            var readers = files.Select(file => new AlgoSeekOptionsReader(file, _referenceDate)).ToList();
+
+            var threadCount = Environment.ProcessorCount - 1;
+            Log.Trace("AlgoSeekOptionsConverter.Convert(): Launching ParalelRunnerController with {0} threads", threadCount);
+
+            var parallelRunnerControllerCancellationTokenSource = new CancellationTokenSource();
+            var parallelRunnerController =  new ParallelRunnerController(threadCount);
+            var parallelRunnerWorkItems = readers.Select(reader => new AlgoSeekOptionsReaderParallelWorkItem(parallelRunnerController, reader, 2500, 100000)).ToList();
+            parallelRunnerWorkItems.ForEach(parallelWorkItem => parallelRunnerController.Schedule(parallelWorkItem));
+            parallelRunnerController.Start(parallelRunnerControllerCancellationTokenSource.Token);
+            
+            var enqueueables = parallelRunnerWorkItems.Select(prwi => prwi.Enqueueable);
+            var synchronizer = new SynchronizingEnumerator(enqueueables);
+
+            Log.Trace("AlgoSeekOptionsConverter.Convert(): Priming synchronizer");
 
             // Prime the synchronizer if required:
             if (synchronizer.Current == null)
@@ -146,6 +160,11 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
             foreach (var symbol in _processors.Keys)
             {
                 _processors[symbol].ForEach(x => x.FlushBuffer(DateTime.MaxValue, true));
+            }
+
+            foreach (var reader in readers)
+            {
+                reader.Dispose();
             }
 
             Log.Trace("AlgoSeekOptionsConverter.Convert(): Finished processing directory: " + _source);
@@ -201,6 +220,68 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
                 sb.AppendLine(LeanData.GenerateLine(data, SecurityType.Option, processor.Resolution));
             }
             return sb.ToString();
+        }
+    }
+
+    public class AlgoSeekOptionsReaderParallelWorkItem : IParallelRunnerWorkItem
+    {
+        private bool _firstLoop = true;
+        private const int FirstLoopCount = 10000;
+        private readonly int _lowerThreshold;
+        private readonly int _upperThreshold;
+        private readonly ParallelRunnerController _controller;
+        private readonly IEnumerator<BaseData> _enumerator;
+
+        public EnqueueableEnumerator<BaseData> Enqueueable
+        {
+            get; private set;
+        }
+         
+        public bool IsReady
+        {
+            get { return Enqueueable.Count < _lowerThreshold; }
+        }
+
+        public AlgoSeekOptionsReaderParallelWorkItem(ParallelRunnerController controller, IEnumerator<BaseData> enumerator, int lowerThreshold, int upperThreshold)
+        {
+            _controller = controller;
+            _enumerator = enumerator;
+            _lowerThreshold = lowerThreshold;
+            _upperThreshold = upperThreshold;
+            Enqueueable = new EnqueueableEnumerator<BaseData>(true);
+        }
+
+        public void Execute()
+        {
+            var count = 0;
+            while (_enumerator.MoveNext())
+            {
+                // drop the data into the back of the enqueueable
+                Enqueueable.Enqueue(_enumerator.Current);
+
+                count++;
+
+                // special behavior for first loop to spool up quickly
+                if (_firstLoop && count > FirstLoopCount)
+                {
+                    // there's more data in the enumerator, reschedule to run again
+                    _firstLoop = false;
+                    _controller.Schedule(this);
+                    return;
+                }
+
+                // stop executing if we've dequeued more than the lower threshold or have
+                // more total that upper threshold in the enqueueable's queue
+                if (count > _lowerThreshold || Enqueueable.Count > _upperThreshold)
+                {
+                    // there's more data in the enumerator, reschedule to run again
+                    _controller.Schedule(this);
+                    return;
+                }
+            }
+
+            // we made it here because MoveNext returned false, stop the enqueueable and don't reschedule
+            Enqueueable.Stop();
         }
     }
 }
