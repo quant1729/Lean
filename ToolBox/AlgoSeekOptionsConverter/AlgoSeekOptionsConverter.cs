@@ -39,7 +39,7 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
         private string _destination;
         private DateTime _referenceDate;
         private Resolution[] _resolutions;
-        private Dictionary<Symbol, List<AlgoSeekOptionsProcessor>> _processors;
+        private Dictionary<Symbol, AlgoSeekOptionsProcessor[]> _processors;
 
 
         /// <summary>
@@ -53,7 +53,7 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
             _source = source;
             _referenceDate = referenceDate;
             _destination = destination;
-            _processors = new Dictionary<Symbol, List<AlgoSeekOptionsProcessor>>();
+            _processors = new Dictionary<Symbol, AlgoSeekOptionsProcessor[]>();
         }
 
         /// <summary>
@@ -129,10 +129,10 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
                 frontier = tick.Time;
 
                 //Add or create the consolidator-flush mechanism for symbol:
-                List<AlgoSeekOptionsProcessor> symbolProcessors;
+                AlgoSeekOptionsProcessor[] symbolProcessors;
                 if (!_processors.TryGetValue(tick.Symbol, out symbolProcessors))
                 {
-                    symbolProcessors = new List<AlgoSeekOptionsProcessor>(2)
+                    symbolProcessors = new[]
                     {
                         new AlgoSeekOptionsProcessor(tick.Symbol, _referenceDate, TickType.Quote, resolution, _destination),
                         new AlgoSeekOptionsProcessor(tick.Symbol, _referenceDate, TickType.Trade, resolution, _destination)
@@ -141,10 +141,8 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
                 }
 
                 // Pass current tick into processor:
-                foreach (var unit in symbolProcessors)
-                {
-                    unit.Process(tick);
-                }
+                symbolProcessors[0].Process(tick);
+                symbolProcessors[1].Process(tick);
 
                 //Due to limits on the files that can be open at a time we need to constantly flush this to disk.
                 totalLinesProcessed++;
@@ -157,9 +155,13 @@ namespace QuantConnect.ToolBox.AlgoSeekOptionsConverter
             while (synchronizer.MoveNext());
 
             Log.Trace("AlgoSeekOptionsConverter.Convert(): Performing final flush to disk... ");
-            foreach (var symbol in _processors.Keys)
+            
+            foreach (var processors in _processors)
             {
-                _processors[symbol].ForEach(x => x.FlushBuffer(DateTime.MaxValue, true));
+                foreach (var processor in processors.Value)
+                {
+                    processor.FlushBuffer(DateTime.MaxValue, true);
+                }
             }
 
             foreach (var reader in readers)
