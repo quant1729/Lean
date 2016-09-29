@@ -13,47 +13,28 @@
  * limitations under the License.
 */
 
-using System.Threading;
 using IBApi;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
     public class ExecutionDetails
     {
-        public ExecutionDetails(int requestId, Contract contract, Execution execution)
-        {
-            this.RequestId = requestId;
-            this.Contract = contract;
-            this.Execution = execution;
-            this.ExecutionDetailsResetEvent = new ManualResetEvent(false);
-        }
-
-        /// <summary>
-        /// Empty Constructor for the Executions
-        /// </summary>
-        public ExecutionDetails() { }
-        
-        /// <summary>
-        /// Request Id
-        /// </summary>
-        public int RequestId { get; set; }
-
         /// <summary>
         /// This structure contains a full description of the contract that was executed.
         /// </summary>
         /// <seealso cref="Contract"/>
-        public Contract Contract { get; set; }
+        public Contract Contract { get; private set; }
 
         /// <summary>
         /// This structure contains addition order execution details.
         /// </summary>
         /// <seealso cref="Execution"/>
-        public Execution Execution { get; set; }
+        public Execution Execution { get; private set; }
 
-        /// <summary>
-        /// Reset Event for each Execution for a specific request id
-        /// </summary>
-        public ManualResetEvent ExecutionDetailsResetEvent { get; set; }
+        public ExecutionDetails(Contract contract, Execution execution)
+        {
+            Contract = contract;
+            Execution = execution;
+        }
     }
-    
 }

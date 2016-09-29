@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using IBApi;
+using QuantConnect.Brokerages.InteractiveBrokers.Client;
 using QuantConnect.Data.Market;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
@@ -25,103 +26,79 @@ using Order = IBApi.Order;
 
 namespace QuantConnect.Brokerages.InteractiveBrokers
 {
-    public partial class InteractiveBrokersBrokerage : EWrapper
+    public partial class InteractiveBrokersBrokerage
     {
         /// <summary>
-        /// Handles error messages from IB
+        /// Handles <see cref="InteractiveBrokersClient.Error"/>
         /// </summary>
-        /// <param name="e">Error Exception Message</param>
-        public virtual void error(Exception e)
-        {
-            error(-1, -1, e.ToString());
-        }
-
-        /// <summary>
-        /// Handles error messages from IB
-        /// </summary>
-        /// <param name="str">Error Message</param>
-        public virtual void error(string str)
-        {
-            error(-1, -1, str);
-        }
-
-        /// <summary>
-        /// Handles error messages from IB
-        /// </summary>
-        /// <param name="id">Error id</param>
-        /// <param name="errorCode">Error Code</param>
-        /// <param name="errorMsg">Error Message</param>
-        public virtual void error(int id, int errorCode, string errorMsg)
+        /// <param name="args">Error event arguments</param>
+        private void error(ErrorEventArgs args)
         {
             // https://www.interactivebrokers.com/en/software/api/apiguide/tables/api_message_codes.htm
 
             // rewrite these messages to be single lined
-            errorMsg = errorMsg.Replace("\r\n", ". ").Replace("\r", ". ").Replace("\n", ". ");
-            Log.Trace(string.Format("InteractiveBrokersBrokerage.HandleError(): Order: {0} ErrorCode: {1} - {2}", id, errorCode, errorMsg));
+            var errorMsg = args.Message.Replace("\r\n", ". ").Replace("\r", ". ").Replace("\n", ". ");
+            Log.Trace(string.Format("InteractiveBrokersBrokerage.HandleError(): Order: {0} ErrorCode: {1} - {2}", args.Id, args.Code, errorMsg));
 
             // figure out the message type based on our code collections below
             var brokerageMessageType = BrokerageMessageType.Information;
-            if (ErrorCodes.Contains(errorCode))
+            if (ErrorCodes.Contains(args.Code))
             {
                 brokerageMessageType = BrokerageMessageType.Error;
             }
-            else if (WarningCodes.Contains(errorCode))
+            else if (WarningCodes.Contains(args.Code))
             {
                 brokerageMessageType = BrokerageMessageType.Warning;
             }
 
             // code 1100 is a connection failure, we'll wait a minute before exploding gracefully
-            if (errorCode == 1100 && !_disconnected1100Fired)
+            if (args.Code == 1100 && !_disconnected1100Fired)
             {
                 _disconnected1100Fired = true;
 
                 // begin the try wait logic
                 TryWaitForReconnect();
             }
-            else if (errorCode == 1102)
+            else if (args.Code == 1102)
             {
                 // we've reconnected
                 _disconnected1100Fired = false;
                 OnMessage(BrokerageMessageEvent.Reconnected(errorMsg));
             }
 
-            if (InvalidatingCodes.Contains(errorCode))
+            if (InvalidatingCodes.Contains(args.Code))
             {
-                Log.Trace(string.Format("InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): Order: {0} ErrorCode: {1} - {2}", id, errorCode, errorMsg));
+                Log.Trace(string.Format("InteractiveBrokersBrokerage.HandleError.InvalidateOrder(): Order: {0} ErrorCode: {1} - {2}", args.Id, args.Code, errorMsg));
 
                 // invalidate the order
-                var order = _orderProvider.GetOrderByBrokerageId(id);
+                var order = _orderProvider.GetOrderByBrokerageId(args.Id);
                 const int orderFee = 0;
                 var orderEvent = new OrderEvent(order, DateTime.UtcNow, orderFee) { Status = OrderStatus.Invalid };
                 OnOrderEvent(orderEvent);
             }
 
-            OnMessage(new BrokerageMessageEvent(brokerageMessageType, errorCode, errorMsg));
+            OnMessage(new BrokerageMessageEvent(brokerageMessageType, args.Code, errorMsg));
         }
 
         /// <summary>
-        /// Gets the current brokerage time
+        /// Handles <see cref="InteractiveBrokersClient.CurrentTimeUtc"/>
         /// </summary>
-        /// <param name="time">Time</param>
-        public virtual void currentTime(long time)
+        /// <param name="args">Current time event arguments</param>
+        private void currentTimeUtc(CurrentTimeEventArgs args)
         {
             // keep track of clock drift
-            var dateTime = new DateTime(time);
-            _brokerTimeDiff = dateTime.Subtract(DateTime.UtcNow);
+            _brokerTimeDiff = args.CurrentTimeUtc.Subtract(DateTime.UtcNow);
         }
 
         /// <summary>
         /// Gets the Tick price
         /// </summary>
-        /// <param name="tickerId">Ticker id</param>
-        /// <param name="field">Tick Type</param>
-        /// <param name="price">Tick price</param>
-        /// <param name="canAutoExecute">Specifies whether price tick is available for automatic execution</param>
-        public virtual void tickPrice(int tickerId, int field, double price, int canAutoExecute)
+        /// <param name="args">Tick price event args</param>
+        private void tickPrice(TickPriceEventArgs args)
         {
-            var symbol = default(Symbol);
+            Symbol symbol;
 
-            if (!_subscribedTickets.TryGetValue(tickerId, out symbol)) return;
+            if (!_subscribedTickets.TryGetValue(args.TickerId, out symbol)) return;
 
             var tick = new Tick();
             // in the event of a symbol change this will break since we'll be assigning the
@@ -134,36 +111,36 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // forex exchange hours are specified in UTC-05
                 tick.Time = tick.Time.ConvertTo(TimeZones.NewYork, TimeZones.EasternStandard);
             }
-            tick.Value = Convert.ToDecimal(price);
+            tick.Value = Convert.ToDecimal(args.Price);
 
-            if (price <= 0 &&
+            if (args.Price <= 0 &&
                 securityType != SecurityType.Future &&
                 securityType != SecurityType.Option)
                 return;
 
-            switch (field)
+            switch (args.Field)
             {
                 case IBApi.TickType.BID: 
 
                     tick.TickType = TickType.Quote;
-                    tick.BidPrice = (decimal) price;
+                    tick.BidPrice = (decimal) args.Price;
                     _lastBidSizes.TryGetValue(symbol, out tick.Quantity);
-                    _lastBidPrices[symbol] = (decimal) price;
+                    _lastBidPrices[symbol] = (decimal) args.Price;
                     break;
 
                 case IBApi.TickType.ASK:
 
                     tick.TickType = TickType.Quote;
-                    tick.AskPrice = (decimal) price;
+                    tick.AskPrice = (decimal) args.Price;
                     _lastAskSizes.TryGetValue(symbol, out tick.Quantity);
-                    _lastAskPrices[symbol] = (decimal) price;
+                    _lastAskPrices[symbol] = (decimal) args.Price;
                     break;
 
                 case IBApi.TickType.LAST:
 
                     tick.TickType = TickType.Trade;
-                    tick.Value = (decimal) price;
-                    _lastPrices[symbol] = (decimal) price;
+                    tick.Value = (decimal) args.Price;
+                    _lastPrices[symbol] = (decimal) args.Price;
                     break;
 
                 case IBApi.TickType.HIGH:
@@ -178,9 +155,9 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
             if (_isClientOnTickPriceSet)
             {
-                if (tickerId == _ibMarketDataTicker && field == IBApi.TickType.ASK)
+                if (args.TickerId == _ibMarketDataTicker && args.Field == IBApi.TickType.ASK)
                 {
-                    _ibConversionRate = Convert.ToDecimal(price);
+                    _ibConversionRate = Convert.ToDecimal(args.Price);
                     _ibClientOnTickPriceResetEvent.Set();
                 }
             }
@@ -259,16 +236,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// <summary>
         /// Returns the next valid id
         /// </summary>
-        /// <param name="orderId">Order id</param>
-        public virtual void nextValidId(int orderId)
+        /// <param name="args">Event arguments containing next order valid id</param>
+        public virtual void nextValidId(NextValidIdEventArgs args)
         {
             // only grab this id when we initialize, and we'll manually increment it here to avoid threading issues
             if (_nextValidID == 0)
             {
-                _nextValidID = orderId;
+                _nextValidID = args.OrderId;
                 _waitForNextValidId.Set();
             }
-            Log.Trace("InteractiveBrokersBrokerage.Callbacks.nextValidId(): " + orderId);
+            Log.Trace("InteractiveBrokersBrokerage.Callbacks.nextValidId(): " + args.OrderId);
         }
 
         /// <summary>
@@ -495,27 +472,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             _ibGetContractDetailsResetEvent.Set();
         }
-
-        /// <summary>
-        /// Handles the execution details
-        /// </summary>
-        /// <param name="reqId">Request id</param>
-        /// <param name="contract">Contract</param>
-        /// <param name="execution">Execution Details</param>
-        public virtual void execDetails(int reqId, Contract contract, Execution execution)
-        {
-            var executionDetails = new ExecutionDetails(reqId, contract, execution);
-            if (reqId == _ibExecutionDetailsRequestId) _executionDetails.TryAdd(reqId, executionDetails);
-        }
-
-        /// <summary>
-        /// Marks the end of downloading the executions
-        /// </summary>
-        /// <param name="reqId">Request id</param>
-        public virtual void execDetailsEnd(int reqId)
-        {
-            if (reqId == _ibExecutionDetailsRequestId) _executionDetails[reqId].ExecutionDetailsResetEvent.Set();
-        }
         
         /// <summary>
         /// Handles the historical data
@@ -551,192 +507,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         {
             _ibHistorialDataResetEvent.Set();
         }
-
-#region Empty Interface methods
-        public virtual void marketDataType(int reqId, int marketDataType)
-        {
-            
-        }
-
-        public virtual void updateMktDepth(int tickerId, int position, int operation, int side, double price, int size)
-        {
-            
-        }
-
-        public virtual void updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, int size)
-        {
-          
-        }
-
-        public virtual void updateNewsBulletin(int msgId, int msgType, string message, string origExchange)
-        {
-           
-        }
-
-        public virtual void position(string account, Contract contract, int pos, double avgCost)
-        {
-            
-        }
-
-        public virtual void positionEnd()
-        {
-            
-        }
-
-        public virtual void realtimeBar(int reqId, long time, double open, double high, double low, double close, long volume, double WAP,
-            int count)
-        {
-            
-        }
-
-        public virtual void scannerParameters(string xml)
-        {
-            
-        }
-
-        public virtual void scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark,
-            string projection, string legsStr)
-        {
-            
-        }
-
-        public virtual void scannerDataEnd(int reqId)
-        {
-            
-        }
-
-        public virtual void receiveFA(int faDataType, string faXmlData)
-        {
-            
-        }
-
-        public virtual void verifyMessageAPI(string apiData)
-        {
-            
-        }
-
-        public virtual void verifyCompleted(bool isSuccessful, string errorText)
-        {
-            
-        }
-
-        public virtual void verifyAndAuthMessageAPI(string apiData, string xyzChallenge)
-        {
-           
-        }
-
-        public virtual void verifyAndAuthCompleted(bool isSuccessful, string errorText)
-        {
-            
-        }
-
-        public virtual void displayGroupList(int reqId, string groups)
-        {
-           
-        }
-
-        public virtual void displayGroupUpdated(int reqId, string contractInfo)
-        {
-            
-        }
-
-        public virtual void connectAck()
-        {
-        }
-
-        public virtual void positionMulti(int requestId, string account, string modelCode, Contract contract, double pos, double avgCost)
-        {
-           
-        }
-
-        public virtual void positionMultiEnd(int requestId)
-        {
-           
-        }
-
-        public virtual void accountUpdateMulti(int requestId, string account, string modelCode, string key, string value, string currency)
-        {
-            
-        }
-
-        public virtual void accountUpdateMultiEnd(int requestId)
-        {
-            
-        }
-
-        public virtual void securityDefinitionOptionParameter(int reqId, string exchange, int underlyingConId, string tradingClass,
-            string multiplier, HashSet<string> expirations, HashSet<double> strikes)
-        {
-           
-        }
-
-        public virtual void securityDefinitionOptionParameterEnd(int reqId)
-        {
-            
-        }
-
-        public virtual void tickString(int tickerId, int field, string value)
-        {
-
-        }
-
-        public virtual void tickGeneric(int tickerId, int field, double value)
-        {
-
-        }
-
-        public virtual void tickEFP(int tickerId, int tickType, double basisPoints, string formattedBasisPoints, double impliedFuture,
-            int holdDays, string futureLastTradeDate, double dividendImpact, double dividendsToLastTradeDate)
-        {
-
-        }
-
-        public virtual void deltaNeutralValidation(int reqId, UnderComp underComp)
-        {
-
-        }
-
-        public virtual void tickOptionComputation(int tickerId, int field, double impliedVolatility, double delta, double optPrice,
-            double pvDividend, double gamma, double vega, double theta, double undPrice)
-        {
-
-        }
-
-        public virtual void tickSnapshotEnd(int tickerId)
-        {
-
-        }
-
-        public virtual void commissionReport(CommissionReport commissionReport)
-        {
-
-        }
-
-        public virtual void fundamentalData(int reqId, string data)
-        {
-
-        }
-
-        public virtual void accountSummary(int reqId, string account, string tag, string value, string currency)
-        {
-
-        }
-
-        public virtual void accountSummaryEnd(int reqId)
-        {
-
-        }
-
-        public virtual void bondContractDetails(int reqId, ContractDetails contract)
-        {
-
-        }
-
-        public virtual void updateAccountTime(string timestamp)
-        {
-
-        }
-#endregion
-
+        
     }
 }

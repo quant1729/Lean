@@ -21,6 +21,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using IBApi;
+using QuantConnect.Brokerages.InteractiveBrokers.Client;
 using QuantConnect.Configuration;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
@@ -57,7 +58,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _isClientOnTickPriceSet = false;
         private int _ibMarketDataTicker;
         private decimal _ibConversionRate;
-        private int _ibExecutionDetailsRequestId;
+        
+        //
+        // having this mutable state at the class level is a recipe for disaster
+        // it would be almost impossible to ensure consistency and atomicy of calls
+        // in a multi-threaded environment
+        //
+        //private int _ibExecutionDetailsRequestId;
+
         private DateTime _ibLastHistoricalData;
         private int _historicalTickerId;
 
@@ -65,15 +73,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly string _account;
         private readonly string _host;
         private readonly int _clientID;
+        private readonly InteractiveBrokersClient _ibClient;
         private readonly IOrderProvider _orderProvider;
         private readonly ISecurityProvider _securityProvider;
         private readonly string _agentDescription;
-        private readonly EClientSocket _ibClient;
         private ContractDetails _ibContractDetails;
         private Contract _ibContract;
         
         private readonly ManualResetEvent _waitForNextValidId = new ManualResetEvent(false);
         private readonly ManualResetEvent _accountHoldingsResetEvent = new ManualResetEvent(false);
+        //
+        // all of these extra reset event should most likely be defined according to the pattern used
+        // in the GetExecutions method. Sharing these between requests is inherently NOT thread-safe
+        //
         private ManualResetEvent _openOrderManualResetEvent = new ManualResetEvent(false);
         private ManualResetEvent _ibFirstAccountUpdateReceived = new ManualResetEvent(false);
         private ManualResetEvent _ibGetContractDetailsResetEvent = new ManualResetEvent(false);
@@ -93,8 +105,6 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private readonly ConcurrentDictionary<string, Holding> _accountHoldings = new ConcurrentDictionary<string, Holding>();
 
         private readonly ConcurrentDictionary<string, ContractDetails> _contractDetails = new ConcurrentDictionary<string, ContractDetails>();
-
-        private readonly ConcurrentDictionary<int, ExecutionDetails> _executionDetails = new ConcurrentDictionary<int, ExecutionDetails>();
 
         private readonly InteractiveBrokersSymbolMapper _symbolMapper = new InteractiveBrokersSymbolMapper();
 
@@ -167,15 +177,21 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _port = port;
             _clientID = IncrementClientID();
             _agentDescription = agentDescription;
-            _ibClient = new EClientSocket(this);
-            Thread.Sleep(10000);
-            // we need to wait until we receive the next valid id from the server
+
+            // initialize the client and wire up the relevant class-level callbacks
+            var client = new InteractiveBrokersClient();
+            client.NextValidId += (sender, args) => nextValidId(args);
+            client.Error += (sender, args) => error(args);
+            client.CurrentTimeUtc += (sender, args) => currentTimeUtc(args);
+
+            _ibClient = client;
+
         }
 
         /// <summary>
-        /// Provides public access to the underlying IBClient instance
+        /// Provides public access to the underlying InteractiveBrokersClient instance
         /// </summary>
-        public EClientSocket Client
+        public InteractiveBrokersClient Client
         {
             get { return _ibClient; }
         }
@@ -315,29 +331,56 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// Gets the execution details matching the filter
         /// </summary>
         /// <returns>A list of executions matching the filter</returns>
-        public ConcurrentDictionary<int, ExecutionDetails> GetExecutions(string symbol, string type, string exchange, DateTime timeSince, string side)
+        public List<ExecutionDetails> GetExecutions(string symbol, string type, string exchange, DateTime? timeSince, string side)
         {
-            
-            var filter = new ExecutionFilter()
+            const string format = "yyyymmdd hh:mm:ss";
+            var filter = new ExecutionFilter
             {
                 AcctCode = _account,
                 ClientId = _clientID,
                 Exchange = exchange,
                 SecType = type ?? "",
                 Symbol = symbol,
-                Time = timeSince.ToString("yyyymmdd hh:mm:ss") ?? DateTime.MinValue.ToString("yyyymmdd hh:mm:ss"),
+                Time = timeSince.HasValue ? timeSince.Value.ToString(format) : DateTime.MinValue.ToString(format),
                 Side = side ?? ""
             };
-            var client = new EClientSocket(this);
-            client.eConnect(_host, _port, IncrementClientID());
-            _ibExecutionDetailsRequestId = GetNextRequestID();
-            Client.reqExecutions(_ibExecutionDetailsRequestId, filter);
-            
-            if (!_executionDetails[_ibExecutionDetailsRequestId].ExecutionDetailsResetEvent.WaitOne(5000))
+
+            var details = new List<ExecutionDetails>();
+            using (var client = new InteractiveBrokersClient())
             {
-                throw new TimeoutException("InteractiveBrokersBrokerage.GetExecutions(): Operation took longer than 1 second.");
+                client.eConnect(_host, _port, IncrementClientID());
+
+                var manualResetEvent = new ManualResetEvent(false);
+
+                var requestID = GetNextRequestID();
+
+                // define our event handlers
+                EventHandler<RequestEndEventArgs> clientOnExecutionDataEnd = (sender, args) =>
+                {
+                    if (args.RequestId == requestID) manualResetEvent.Set();
+                };
+                EventHandler<ExecutionDetailsEventArgs> clientOnExecDetails = (sender, args) =>
+                {
+                    if (args.RequestId == requestID) details.Add(args.ExecutionDetails);
+                };
+
+                client.ExecutionDetails += clientOnExecDetails;
+                client.ExecutionDetailsEnd += clientOnExecutionDataEnd;
+
+                // no need to be fancy with request id since that's all this client does is 1 request
+                client.reqExecutions(requestID, filter);
+
+                if (!manualResetEvent.WaitOne(5000))
+                {
+                    throw new TimeoutException("InteractiveBrokersBrokerage.GetExecutions(): Operation took longer than 1 second.");
+                }
+
+                // remove our event handlers
+                client.ExecutionDetails -= clientOnExecDetails;
+                client.ExecutionDetailsEnd -= clientOnExecutionDataEnd;
             }
-            return _executionDetails;
+
+            return details;
         }
 
         /// <summary>
